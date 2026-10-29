@@ -24,7 +24,7 @@ function showRoute(force = false) {
   document.getElementById('workspace').hidden = isHome;
   document.body.classList.toggle('in-app', !isHome);
   document.getElementById('load-help').hidden = true;
-  document.title = isHome ? 'まなびのひろば' : `${apps[route].name} | まなびのひろば`;
+  document.title = isHome ? '自立活動の視点に立った自作教材アプリケーション' : `${apps[route].name} | 自立活動の視点に立った自作教材アプリケーション`;
   if (isHome) { window.scrollTo(0, 0); return; }
   const app = apps[route];
   const title = document.getElementById('app-name');
