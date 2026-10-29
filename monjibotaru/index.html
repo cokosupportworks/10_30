@@ -65,7 +65,7 @@
 
     <div id="loadingOverlay">
         <div class="loading-spinner mb-4"></div>
-        <div class="text-xl font-bold text-gray-600 tracking-widest animate-pulse font-klee">じゅんびちゅう...</div>
+        <div id="loadingMessage" role="status" class="text-xl font-bold text-gray-600 tracking-widest animate-pulse font-klee">じゅんびちゅう...</div>
     </div>
 
     <!-- ★起動時ポップアップ (おとの確認) -->
@@ -544,9 +544,63 @@
         // ==========================================
         // ストレージシステム
         // ==========================================
-        function openDB() { return new Promise((resolve, reject) => { const request = indexedDB.open(DB_NAME, DB_VERSION); request.onupgradeneeded = (e) => { const db = e.target.result; if (!db.objectStoreNames.contains('scores')) db.createObjectStore('scores', { keyPath: 'id' }); if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings', { keyPath: 'id' }); }; request.onsuccess = (e) => resolve(e.target.result); request.onerror = (e) => reject(e); }); }
-        function saveToIDB(storeName, data) { return new Promise(async (resolve) => { try { const db = await openDB(); const tx = db.transaction(storeName, 'readwrite'); const store = tx.objectStore(storeName); const req = store.put({ id: 'main', data: data }); req.onsuccess = () => resolve(true); req.onerror = () => resolve(false); } catch (e) { resolve(false); } }); }
-        async function loadFromIDB(storeName) { try { const db = await openDB(); return new Promise(resolve => { const r = db.transaction(storeName, 'readonly').objectStore(storeName).get('main'); r.onsuccess = () => resolve(r.result ? r.result.data : null); r.onerror = () => resolve(null); }); } catch (e) { return null; } }
+        // Browser storage can be unavailable or blocked inside an embedded view.
+        // Always settle so localStorage/cookies can serve as fallbacks.
+        function withDeadline(promise, milliseconds, label) {
+            return new Promise((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error(label + ' timeout')), milliseconds);
+                Promise.resolve(promise).then(value => { clearTimeout(timer); resolve(value); }, error => { clearTimeout(timer); reject(error); });
+            });
+        }
+        function openDB() {
+            return new Promise((resolve, reject) => {
+                let expired = false;
+                const timer = setTimeout(() => { expired = true; reject(new Error('IndexedDB timeout')); }, 1500);
+                let request;
+                try { request = indexedDB.open(DB_NAME, DB_VERSION); }
+                catch (error) { clearTimeout(timer); reject(error); return; }
+                request.onupgradeneeded = (event) => {
+                    if (expired) { event.target.transaction.abort(); return; }
+                    const db = event.target.result;
+                    if (!db.objectStoreNames.contains('scores')) db.createObjectStore('scores', { keyPath: 'id' });
+                    if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings', { keyPath: 'id' });
+                };
+                request.onsuccess = () => {
+                    clearTimeout(timer);
+                    if (expired) { request.result.close(); return; }
+                    resolve(request.result);
+                };
+                request.onerror = request.onblocked = () => { expired = true; clearTimeout(timer); reject(request.error || new Error('IndexedDB blocked')); };
+            });
+        }
+        async function saveToIDB(storeName, data) {
+            let db;
+            try {
+                db = await openDB();
+                await withDeadline(new Promise((resolve, reject) => {
+                    const tx = db.transaction(storeName, 'readwrite');
+                    tx.oncomplete = resolve;
+                    tx.onerror = tx.onabort = () => reject(tx.error || new Error('Storage write failed'));
+                    tx.objectStore(storeName).put({ id: 'main', data });
+                }), 1500, 'Storage write');
+                return true;
+            } catch (error) { return false; }
+            finally { if (db) db.close(); }
+        }
+        async function loadFromIDB(storeName) {
+            let db;
+            try {
+                db = await openDB();
+                return await withDeadline(new Promise((resolve, reject) => {
+                    const tx = db.transaction(storeName, 'readonly');
+                    tx.onabort = () => reject(tx.error || new Error('Storage read aborted'));
+                    const request = tx.objectStore(storeName).get('main');
+                    request.onsuccess = () => resolve(request.result ? request.result.data : null);
+                    request.onerror = () => reject(request.error);
+                }), 1500, 'Storage read');
+            } catch (error) { return null; }
+            finally { if (db) db.close(); }
+        }
         function setCookie(name, val, days) { try { const d = new Date(); d.setTime(d.getTime() + (days*24*60*60*1000)); document.cookie = name + "=" + encodeURIComponent(val) + ";expires="+ d.toUTCString() + ";path=/;SameSite=Strict"; } catch(e){} }
         function getCookie(name) { try { const n = name + "="; const ca = document.cookie.split(';'); for(let i=0;i<ca.length;i++) { let c = ca[i]; while (c.charAt(0)==' ') c = c.substring(1); if (c.indexOf(n) == 0) return decodeURIComponent(c.substring(n.length)); } } catch(e){} return null; }
 
@@ -555,7 +609,7 @@
             if (idbData && Object.keys(idbData).length > 0) { data = idbData; src = "IDB"; }
             if (!data) { try { const ls = localStorage.getItem(STORAGE_KEY_SCORES); if(ls){ data = JSON.parse(ls); src = "LS"; } } catch(e){} }
             if (!data) { const ck = getCookie(STORAGE_KEY_SCORES); if(ck){ try{ data = JSON.parse(ck); src = "Cookie"; }catch(e){} } }
-            if (data) { state.scores = data; localStorage.setItem(STORAGE_KEY_SCORES, JSON.stringify(data)); saveToIDB('scores', data); } else { state.scores = {}; }
+            if (data) { state.scores = data; try { localStorage.setItem(STORAGE_KEY_SCORES, JSON.stringify(data)); } catch (error) { log('保存領域を利用できません: ' + error.message); } saveToIDB('scores', data); } else { state.scores = {}; }
             updateDataCount();
             if(els.systemStatusDisplay) { els.systemStatusDisplay.textContent = "OK (" + src + ")"; els.systemStatusDisplay.className = "text-[10px] font-mono text-white bg-green-500 px-2 py-1 rounded-full shadow-inner"; }
         }
@@ -1229,7 +1283,8 @@
             initializeData(); setupEventListeners(); updateUI(); updateSelectorUI(); resetCanvas(); renderGrid(); startHotaruCycle(); 
         }
 
-        async function onResume() { log("画面復帰: データ再読み込み"); await loadScores(); await loadAppSettings(); updateSelectorUI(); renderGrid(); updateUI(); }
+        let appInitialized = false;
+        async function onResume() { if (!appInitialized) return; log("画面復帰: データ再読み込み"); await loadScores(); await loadAppSettings(); updateSelectorUI(); renderGrid(); updateUI(); }
         window.addEventListener('pageshow', (event) => { if (event.persisted) onResume(); });
         document.addEventListener('visibilitychange', () => { 
             if (document.visibilityState === 'visible') { audioUnlocked = false; document.addEventListener('touchstart', unlockAudio, { once: true, passive: true }); document.addEventListener('mousedown', unlockAudio, { once: true, passive: true }); onResume(); } 
@@ -1237,21 +1292,47 @@
         });
         window.addEventListener('focus', onResume);
 
-        window.onload = async () => {
-            const loadingOverlay = document.getElementById('loadingOverlay');
-            try { await document.fonts.ready; await document.fonts.load('1rem "Klee One"'); await document.fonts.load('1rem "Zen Maru Gothic"'); } catch (e) {}
-            
-            await init();
-            if (document.fonts) { document.fonts.ready.then(() => { drawGuide(); }); }
+        async function startApplication() {
+            const overlay = document.getElementById('loadingOverlay');
+            const message = document.getElementById('loadingMessage');
+            try {
+                message.textContent = 'もじの じゅんびちゅう...';
+                if (document.fonts) {
+                    try {
+                        await withDeadline(Promise.all([
+                            document.fonts.load('1rem "Klee One"'),
+                            document.fonts.load('1rem "Zen Maru Gothic"')
+                        ]), 4000, 'Font loading');
+                    } catch (error) { log('標準フォントで開始します: ' + error.message); }
+                }
+                message.textContent = 'きろくの よみこみちゅう...';
+                await init();
+                appInitialized = true;
+                overlay.style.display = 'none';
+                if (state.showSoundPopupOnStart) openModal(els.soundInitPopup, els.soundInitPopupInner);
+                if (document.fonts) {
+                    const redraw = () => { if (appInitialized) { drawGuide(); drawDemoBase(); } };
+                    document.fonts.ready.then(redraw).catch(error => log(error.message));
+                    document.fonts.addEventListener('loadingdone', redraw);
+                }
+            } catch (error) {
+                console.error('もんじぼたるの起動エラー', error);
+                message.classList.remove('animate-pulse');
+                message.textContent = 'じゅんびが できませんでした';
+                const detail = document.createElement('p');
+                detail.textContent = 'エラー: ' + error.message;
+                detail.style.cssText = 'max-width:90%;overflow-wrap:anywhere;padding:16px;text-align:center';
+                const retry = document.createElement('button');
+                retry.textContent = 'もういちど ひらく';
+                retry.style.cssText = 'padding:12px 24px;background:white;border:2px solid #6366f1;border-radius:12px';
+                retry.addEventListener('click', () => location.reload());
+                overlay.append(detail, retry);
+            }
+        }
+        // The app elements already exist here. Do not wait for window.load,
+        // which also waits for unrelated external fonts, images and audio.
+        startApplication();
 
-            setTimeout(() => { 
-                loadingOverlay.style.opacity = '0'; 
-                setTimeout(() => { 
-                    loadingOverlay.style.display = 'none'; 
-                    if (state.showSoundPopupOnStart) openModal(els.soundInitPopup, els.soundInitPopupInner);
-                }, 500); 
-            }, 500);
-        };
     </script>
 </body>
 </html>
